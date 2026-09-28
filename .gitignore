@@ -1,0 +1,32 @@
+# Go
+/bin/
+/dist/
+*.exe
+*.exe~
+*.test
+*.out
+PROJECT_PLAN_3208.md
+
+# Node / web
+web/node_modules/
+web/dist/
+node_modules/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Terraform (stretch, Section 13.2)
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+
+# Submission artifacts
+*.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
