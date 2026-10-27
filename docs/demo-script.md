@@ -192,7 +192,74 @@ kubectl -n flaketracker rollout history deployment/api
 - **Why HTTP and not HTTPS?** A managed certificate needs a domain name; in production we would terminate TLS at the load balancer.
 - **Do the nodes scale automatically?** Pods do. The node pool is a fixed three; a node autoscaler is the next step.
 
-## 6. After the demo (put it all back)
+## 6. Deployment choices: what we need, why we chose it, what it costs
+
+**The 20-second answer if you are asked "why these choices?":** *"Each choice is the cheapest option that still lets us show every requirement: scalability, reliability, load balancing, orchestration and rollouts. The 24/7 list price is about US$185 a month, and about US$110 after Google's free-tier credit for one zonal cluster."*
+
+Costs are from the Google Cloud Pricing Calculator (Melbourne, 24/7). Re-check them before you quote them.
+
+### Cluster, zone and machines
+
+| Choice | What we need | Why this one | Cost (US$ / month) |
+|---|---|---|---|
+| **GKE Standard** (not Autopilot, not Cloud Run) | To show nodes, drain a node, run databases on disks, and use Ingress and autoscalers directly | Standard exposes the nodes and the full Kubernetes API. Autopilot and Cloud Run hide the nodes, so we couldn't demonstrate draining or spreading across nodes | Cluster fee 73, covered by the free tier for one zonal cluster = about 0 |
+| **One cluster** | One environment to run and demo | A second cluster would double the nodes and the fee, and nothing in the requirements needs it | (one fee only) |
+| **Zonal** (`australia-southeast2-b`), not regional | Low cost; one zone is enough for a demo | A regional cluster puts nodes in 3 zones (3x the VMs) and loses the free-tier credit. The trade-off is a zone outage would take us down, so we say so openly | 0 extra |
+| **Region: Melbourne** (`australia-southeast2`) | Low latency for Australian users and the course | Closest region to us. Pricing differs by region, and this was checked in the calculator | (in the rows below) |
+| **3 nodes** | Drain one node and still have two to spread replicas across | Two nodes would leave a single node during a drain, and one node would show no spreading at all | 3 x 29.50 = 88.50 |
+| **e2-medium** (2 shared vCPU, 4 GB) | Enough room for our 11 pods (8 service pods and 3 databases) plus GKE's own system pods | GKE's system pods take about 450m CPU on every node, leaving about 940m usable on an e2-medium, so a smaller machine would have very little room. A bigger one costs more and isn't needed | included above |
+| **On-demand, not Spot** | A machine that stays up during the marked demo | Spot is about half the price (US$0.0202 vs 0.0404 an hour) but can be reclaimed at any time, and marks are lost for demo disruptions. We use Spot only for non-demo work | included above |
+| **30 GB balanced disks** | A normal boot disk | pd-balanced is the standard default, cheaper than SSD and faster than standard; 30 GB leaves room for images | about 12 for 3 |
+| **Fixed node pool, no cluster autoscaler** | Predictable cost | Pods autoscale, nodes don't. The node pool is a fixed 3, so the bill can't surprise us. A node autoscaler is the stated next step | 0 |
+| **Regular release channel** | Patched Kubernetes without manual upgrades | Google keeps the version current on the standard schedule | 0 |
+| **System-only logging and monitoring** | Our own logs read with `kubectl logs` | Sending every application log line to Cloud Logging adds a charge we don't need | about 0 |
+
+### Traffic
+
+| Choice | What we need | Why this one | Cost (US$ / month) |
+|---|---|---|---|
+| **GKE Ingress, which creates a Google external HTTP(S) load balancer** | One public address that routes `/`, `/api` and `/ingest` to different services, with health checks | A `Service` of type LoadBalancer is layer 4 only and would need one load balancer, and one cost, per service, with no path routing. Ingress gives path routing behind a single forwarding rule | 18.58 |
+| **Reserved global static IP** (`flaketracker-ip`) | An address that never changes, for the README, load test and demo | A reserved address survives re-creating the Ingress. It's free while attached to the load balancer | 0 while in use |
+| **Health checks on `/healthz`** | The load balancer only sends traffic to healthy pods | Pods that aren't ready are left out, so users never see a pod that is still starting | 0 |
+| **HTTP only, no HTTPS** | Not required by the course | A managed certificate needs a domain name, and a second forwarding rule would add about US$18. Stated as a known limit | 0 |
+
+### Scaling, reliability and releases
+
+| Choice | What we need | Why this one | Cost (US$ / month) |
+|---|---|---|---|
+| **Horizontal Pod Autoscaler on `ingest` (2 to 8) and `api` (2 to 6), scaling at 60% CPU** | Handle bursts of CI results and dashboard traffic | These two services get uneven load. CPU is built in, needs no extra tools and is simple to demo. Ingest was seen scaling from 2 to 5 pods in under 40 seconds | 0 (uses existing nodes) |
+| **No autoscaler on `analyzer` and `web`** | Don't waste capacity | The analyzer elects one leader to do the work, so more copies wouldn't make it faster. `web` serves small static files | 0 |
+| **At least 2 replicas of every service** | Survive a pod or node failure | One replica would mean an outage whenever a pod restarts. Spread across nodes by topology rules | 0 (small requests fit) |
+| **Small CPU requests (50m, web 10m) with limits kept** | Fit everything on 3 small nodes and let autoscaling work | The autoscaler measures CPU against the request. Larger requests filled the nodes (a drained database pod stayed Pending), so we lowered them. Limits still allow bursts | 0 |
+| **Pod disruption budgets (minimum 1) on stateless services** | A drain or upgrade never removes the last copy | They protect availability during maintenance. Not on the single-replica databases, because a budget there would block a drain forever | 0 |
+| **Rolling updates, maxUnavailable 0 and maxSurge 1** | Release with no downtime, and a bad release never replaces working pods | Old pods stay until the new one is healthy. The cost is one extra pod for a short time | 0 |
+| **Images tagged with the Git commit** (never `latest`) | Know exactly what runs, and roll back reliably | `latest` can't be traced or rolled back. A commit tag can | 0 |
+| **Distroless Go images, nginx for the front end, in Artifact Registry** | Small, quick-to-pull images with little attack surface | About 20 MB each, so pods start fast. Artifact Registry is in the same region | about 0.05 |
+
+### Data
+
+| Choice | What we need | Why this one | Cost (US$ / month) |
+|---|---|---|---|
+| **PostgreSQL 17, one database per service** | Constraints, uniqueness (for safe retries) and joins, plus true microservice independence | A relational database enforces the rules we need. Separate databases mean one service's data or failure can't break another's | see disks below |
+| **Databases inside the cluster (StatefulSets), not Cloud SQL** | A low bill | Three managed instances would cost many times more than three small disks. The trade-off is no managed backups or automatic failover, which we state openly | 0.54 for 8 GiB of disks |
+| **Persistent disks sized 5, 2 and 1 GB** | Hold the data with headroom | Matched to what each database stores (about 50 MB of seeded data at most), so we don't pay for unused space | included above |
+| **Single replica per database, no pod disruption budget** | Keep it simple and cheap | Replicated Postgres adds complexity and cost. A drained database pod moved to another node and was ready again in about 33 seconds | 0 |
+
+### Totals
+
+| | US$ / month |
+|---|---|
+| GKE (cluster fee, 3 nodes, boot disks) | 165.54 (calculator, with 10 GiB boot disks; about 8 more at 30 GiB) |
+| Load balancer | 18.58 |
+| Database disks | 0.54 |
+| Artifact Registry | 0.05 |
+| **List-price total** | **184.71** (about 193 at 30 GiB boot disks) |
+| Less GKE free-tier credit | -74.40 |
+| **Estimated bill** | **about 110** (about 118 at 30 GiB) |
+
+Cost controls: the nodes scale to zero outside working hours (`scale-down.sh`), which cuts the real bill to roughly US$40 a month, and Spot would roughly halve the node cost for non-demo use.
+
+## 7. After the demo (put it all back)
 
 ```bash
 # Put the analyzer back on v1 so the next run starts the same way.
