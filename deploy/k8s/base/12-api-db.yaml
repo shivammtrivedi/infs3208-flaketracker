@@ -1,0 +1,136 @@
+# -----------------------------------------------------------------------------
+# 12. api-db: api's PRIVATE PostgreSQL database. Identical to
+# 10-api-db.yaml apart from names, disk size and credentials; read the comments
+# there for the reasoning behind every setting. If you change one database, change all three.
+# -----------------------------------------------------------------------------
+
+# Headless Service (clusterIP: None): no virtual IP and no load balancing, just a
+# DNS name. "api-db" resolves straight to the pod's IP, and the pod also gets
+# the stable name api-db-0.api-db. Only api is given this address and
+# the password; the other services never learn them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-db
+  labels:
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app: api-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: api-db
+  labels:
+    app.kubernetes.io/component: database
+spec:
+  serviceName: api-db          # must match the headless Service above
+  replicas: 1                     # a single primary; high availability is future work (Cloud SQL HA)
+  selector:
+    matchLabels:
+      app: api-db
+  template:
+    metadata:
+      labels:
+        app: api-db
+        tier: database            # lets the anti-affinity below spread ALL databases apart
+    spec:
+      # Wait up to a minute so Postgres can shut down cleanly instead of being
+      # killed mid-write when the pod is stopped or moved.
+      terminationGracePeriodSeconds: 60
+
+      # Run as postgres' own non-root user (uid/gid 999 in the official image).
+      # fsGroup makes Kubernetes give that group write access to the mounted disk;
+      # without it the "Permission denied" problem from Assignment 2 returns
+      # (the disk arrives owned by root).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Prefer different nodes for the three databases, so draining one node
+      # takes down at most one database (the failure-isolation demo relies on it).
+      # "preferred" = a soft rule: if nodes are scarce they may still share one.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    tier: database
+
+      containers:
+        - name: postgres
+          image: postgres:17      # pinned major version (Postgres 18 changed the data directory layout)
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: api
+            - name: POSTGRES_DB
+              value: api
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-db-credentials   # created by scripts/k8s/create-secrets.sh
+                  key: password
+            # A brand-new cloud disk contains a "lost+found" folder at its root, which
+            # makes Postgres's initdb refuse to start (also from Assignment 2). Keeping
+            # the data in a SUBDIRECTORY of the mount avoids it.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:             # what the scheduler reserves for it
+              cpu: 50m
+              memory: 256Mi
+            limits:               # the most it may use
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # pg_isready asks Postgres "are you accepting connections?". Not-ready
+          # pods are removed from the Service; failing liveness restarts the container.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "api", "-d", "api"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "api", "-d", "api"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+  # Each pod gets its OWN disk, created from this template (api-db-0 gets a
+  # PersistentVolumeClaim called data-api-db-0). It stays when the pod is
+  # deleted or rescheduled, which is what makes the data persistent.
+  # No storageClassName: the cluster's default is used (pd-balanced on GKE).
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]    # mounted read-write by one node at a time
+        resources:
+          requests:
+            storage: 1Gi                  # only quarantine records live here; tiny

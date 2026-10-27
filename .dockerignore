@@ -1,0 +1,11 @@
+# This file controls what Docker may copy from the repo root into an image build
+# (the Go images use the repo root as their build context). It is an ALLOW-list:
+# ignore everything, then re-allow only what a Go build needs. That way .env
+# files, .git, node_modules, ai-log.md and the rest can never end up inside an
+# image, even if someone adds a broad COPY later.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!db/migrations/

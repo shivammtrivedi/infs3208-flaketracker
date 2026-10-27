@@ -1,0 +1,94 @@
+# -----------------------------------------------------------------------------
+# edge: a stand-in for the cloud Ingress, ONLY for local rehearsal. A plain Kind
+# cluster has no Google load balancer, so this nginx does the same path routing
+# (/api -> api, /ingest -> ingest, everything else -> web), letting the whole app
+# be used in a browser. Reach it with:
+#   kubectl -n flaketracker port-forward svc/edge 8080:80      then open http://localhost:8080
+# The real Ingress (overlays/gke/ingress.yaml) is the one thing that can only be
+# tested on GKE itself.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-config
+  labels:
+    app.kubernetes.io/component: edge
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        client_max_body_size 5m;     # ingest accepts bodies up to 5 MB
+
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+        # "api", "ingest" and "web" are the Kubernetes Service names; cluster DNS
+        # resolves them, and each Service spreads requests over its pods.
+        # /internal/* is deliberately not routed: it falls through to "/" (web),
+        # so the services' private endpoints stay private, as with the real Ingress.
+        location /api/    { proxy_pass http://api;    proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /ingest/ { proxy_pass http://ingest; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /        { proxy_pass http://web;    proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+  labels:
+    app.kubernetes.io/component: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge
+  template:
+    metadata:
+      labels:
+        app: edge
+    spec:
+      containers:
+        - name: edge
+          image: nginxinc/nginx-unprivileged:1.28-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: edge-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge
+  labels:
+    app.kubernetes.io/component: edge
+spec:
+  type: ClusterIP
+  selector:
+    app: edge
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

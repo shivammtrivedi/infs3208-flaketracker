@@ -1,0 +1,28 @@
+# Kustomize combines the files below into one deployable set, and overlays
+# (../overlays/local, ../overlays/gke) then adjust it per environment without
+# copying or editing these files. Deploy an environment with, for example:
+#   kubectl apply -k deploy/k8s/overlays/gke
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Put every object in this namespace (so the manifests don't each repeat it).
+namespace: flaketracker
+
+resources:
+  - 00-namespace.yaml
+  - 01-configmap.yaml
+  - 10-ingest-db.yaml
+  - 11-analyzer-db.yaml
+  - 12-api-db.yaml
+  - 20-migrate-jobs.yaml
+  - 30-ingest.yaml
+  - 31-api.yaml
+  - 32-analyzer.yaml
+  - 33-web.yaml
+
+# A label on every object so `kubectl get all -l app.kubernetes.io/part-of=flaketracker` finds them.
+# includeSelectors: false keeps it OUT of the Deployments' selectors (those never change after creation).
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: flaketracker
+    includeSelectors: false

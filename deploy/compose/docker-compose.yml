@@ -1,0 +1,262 @@
+# FlakeTracker, the whole system on one machine. Run from this folder:
+#
+#   docker compose up -d --build        start everything
+#   docker compose --profile tools run --rm seed --mode=db --truncate    load demo data
+#   open http://localhost:8080
+#
+# It mirrors the cloud deployment: three databases (one per service), the
+# services with two replicas each, and a proxy that routes by URL path like the
+# GKE Ingress. See the "Run with Docker Compose" section of the root README.
+#
+# The passwords below are local-only defaults. Override any of them by exporting
+# the variable first (e.g. INGEST_DB_PASSWORD=...) or putting it in a .env file
+# next to this one; never commit real secrets.
+
+name: flaketracker
+
+# ---- reusable fragments (YAML anchors: define once with &name, reuse with *name) ----
+
+# How every Go image is built (see build/go.Dockerfile). The context is the
+# repo root, two folders up from this file.
+x-go-build: &go-build
+  context: ../..
+  dockerfile: build/go.Dockerfile
+
+# Metadata stamped into each binary, shown in the dashboard footer.
+# GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
+x-build-info: &build-info
+  VERSION: ${VERSION:-local}
+  COMMIT: ${GIT_SHA:-local}
+
+# Settings shared by the long-running Go services. The distroless images have no
+# curl, so the health check is the service's own `healthcheck` mode, which
+# calls its /readyz (see internal/httpx/healthcheck.go).
+x-go-service: &go-service
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "/app", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
+# Settings shared by the three Postgres containers.
+x-postgres: &postgres
+  image: postgres:17
+  restart: unless-stopped
+
+services:
+  # ================= databases: one private Postgres per service =================
+  # None of them publishes a port to your machine, so only the service that owns
+  # a database can reach it (other services aren't given its address or password).
+  ingest-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: ingest
+      POSTGRES_PASSWORD: ${INGEST_DB_PASSWORD:-ingestdb}
+      POSTGRES_DB: ingest
+    volumes:
+      - ingest-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingest -d ingest"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  analyzer-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: analyzer
+      POSTGRES_PASSWORD: ${ANALYZER_DB_PASSWORD:-analyzerdb}
+      POSTGRES_DB: analyzer
+    volumes:
+      - analyzer-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analyzer -d analyzer"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: api
+      POSTGRES_PASSWORD: ${API_DB_PASSWORD:-apidb}
+      POSTGRES_DB: api
+    volumes:
+      - api-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U api -d api"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ================= migrations: create each service's tables, then exit =================
+  # Same image three times, each pointed at a different database. `restart: "no"`
+  # because they run to completion; services below wait for them with
+  # `condition: service_completed_successfully`.
+  migrate-ingest:
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: migrate }
+    image: flaketracker/migrate:local
+    restart: "no"
+    command: ["--service=ingest"]
+    environment:
+      DB_HOST: ingest-db
+      DB_NAME: ingest
+      DB_USER: ingest
+      DB_PASSWORD: ${INGEST_DB_PASSWORD:-ingestdb}
+    depends_on:
+      ingest-db: { condition: service_healthy }
+
+  migrate-analyzer:
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: migrate }
+    image: flaketracker/migrate:local
+    restart: "no"
+    command: ["--service=analyzer"]
+    environment:
+      DB_HOST: analyzer-db
+      DB_NAME: analyzer
+      DB_USER: analyzer
+      DB_PASSWORD: ${ANALYZER_DB_PASSWORD:-analyzerdb}
+    depends_on:
+      analyzer-db: { condition: service_healthy }
+
+  migrate-api:
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: migrate }
+    image: flaketracker/migrate:local
+    restart: "no"
+    command: ["--service=api"]
+    environment:
+      DB_HOST: api-db
+      DB_NAME: api
+      DB_USER: api
+      DB_PASSWORD: ${API_DB_PASSWORD:-apidb}
+    depends_on:
+      api-db: { condition: service_healthy }
+
+  # ================= the four application services =================
+  # `deploy.replicas: 2` starts two copies of each, like the Kubernetes
+  # Deployments. They publish no ports (copies would clash); all traffic
+  # arrives through the proxy, which balances across the copies.
+  ingest:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: ingest }
+    image: flaketracker/ingest:local
+    deploy: { replicas: 2 }
+    environment:
+      DB_HOST: ingest-db
+      DB_NAME: ingest
+      DB_USER: ingest
+      DB_PASSWORD: ${INGEST_DB_PASSWORD:-ingestdb}
+      INGEST_API_KEY: ${INGEST_API_KEY:-ingestkey}
+    depends_on:
+      ingest-db: { condition: service_healthy }
+      migrate-ingest: { condition: service_completed_successfully }
+
+  analyzer:
+    <<: *go-service
+    build:
+      <<: *go-build
+      # ALGORITHM is baked in at build time: ANALYZER_ALGORITHM=v2 docker compose up -d --build analyzer
+      args: { <<: *build-info, SERVICE: analyzer, ALGORITHM: "${ANALYZER_ALGORITHM:-v1}" }
+    image: flaketracker/analyzer:local
+    # Two copies, but only one (the leader) computes; the other stands by.
+    deploy: { replicas: 2 }
+    environment:
+      DB_HOST: analyzer-db
+      DB_NAME: analyzer
+      DB_USER: analyzer
+      DB_PASSWORD: ${ANALYZER_DB_PASSWORD:-analyzerdb}
+      INGEST_URL: http://ingest:8080
+      # 5 s (the cloud default is 15 s) so demo data shows up quickly.
+      ANALYZER_INTERVAL: ${ANALYZER_INTERVAL:-5s}
+    depends_on:
+      analyzer-db: { condition: service_healthy }
+      migrate-analyzer: { condition: service_completed_successfully }
+      ingest: { condition: service_healthy }
+
+  api:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: api }
+    image: flaketracker/api:local
+    deploy: { replicas: 2 }
+    environment:
+      DB_HOST: api-db
+      DB_NAME: api
+      DB_USER: api
+      DB_PASSWORD: ${API_DB_PASSWORD:-apidb}
+      INGEST_URL: http://ingest:8080
+      ANALYZER_URL: http://analyzer:8080
+    depends_on:
+      api-db: { condition: service_healthy }
+      migrate-api: { condition: service_completed_successfully }
+
+  web:
+    build: ../../web
+    image: flaketracker/web:local
+    restart: unless-stopped
+    deploy: { replicas: 2 }
+    healthcheck:
+      # nginx's Alpine image includes busybox wget.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ================= the front door =================
+  # The only container that publishes a port. http://localhost:8080 is the whole app.
+  proxy:
+    image: nginxinc/nginx-unprivileged:1.28-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./proxy.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./proxy-headers.conf:/etc/nginx/proxy-headers.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      web: { condition: service_healthy }
+      api: { condition: service_healthy }
+      ingest: { condition: service_healthy }
+
+  # ================= tools (not started by `docker compose up`) =================
+  # The demo-data generator. `profiles: [tools]` keeps it out of a normal `up`;
+  # run it on demand, inside the Compose network, so it can reach ingest-db
+  # without that database ever being exposed to your machine:
+  #   docker compose --profile tools run --rm seed --mode=db --truncate
+  #   docker compose --profile tools run --rm seed --mode=api --url=http://proxy:8080 --api-key=ingestkey
+  seed:
+    profiles: [tools]
+    build:
+      <<: *go-build
+      args: { <<: *build-info, SERVICE: seed }
+    image: flaketracker/seed:local
+    command: ["--mode=db"]
+    environment:
+      DB_HOST: ingest-db
+      DB_NAME: ingest
+      DB_USER: ingest
+      DB_PASSWORD: ${INGEST_DB_PASSWORD:-ingestdb}
+      INGEST_API_KEY: ${INGEST_API_KEY:-ingestkey}
+    depends_on:
+      ingest-db: { condition: service_healthy }
+      migrate-ingest: { condition: service_completed_successfully }
+
+volumes:
+  ingest-db-data:
+  analyzer-db-data:
+  api-db-data:

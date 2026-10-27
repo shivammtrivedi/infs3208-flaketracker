@@ -1,0 +1,139 @@
+# -----------------------------------------------------------------------------
+# 32. analyzer: pulls new results from ingest's feed, scores every test for
+# flakiness, and serves the leaderboard/stats over an internal API. Owns
+# analyzer-db. See 30-ingest.yaml for the reasoning behind the shared settings.
+#
+# Differences from ingest/api:
+#  * No autoscaler: it is batch compute, and only ONE replica (the leader) computes
+#    at a time. Leadership is a Postgres advisory lock, so the second copy stands by,
+#    serves reads, and takes over within seconds if the leader dies. Two copies are
+#    for availability, not for speed.
+#  * No Ingress route: only api calls it, over the cluster network.
+#  * Which scoring algorithm (v1 or v2) runs is baked into the IMAGE at build time,
+#    so the rollout demo is a genuine image change (kubectl set image ... v2).
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analyzer
+  labels:
+    app.kubernetes.io/component: app
+  annotations:
+    kubernetes.io/change-cause: "initial deployment"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: analyzer
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: analyzer
+    spec:
+      terminationGracePeriodSeconds: 30    # lets the leader release its lock on SIGTERM so a standby takes over at once
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: analyzer
+      containers:
+        - name: analyzer
+          image: flaketracker/analyzer:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: flaketracker-config      # scoring settings, intervals and INGEST_URL
+          env:
+            - name: DB_HOST
+              value: analyzer-db
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: analyzer
+            - name: DB_USER
+              value: analyzer
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: analyzer-db-credentials
+                  key: password
+          # More headroom than the other services: the first cycle after a big
+          # data load processes ~135,000 results in pages of 5,000.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 384Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+
+---
+# ClusterIP only. Nothing routes to this from outside; api reaches it at http://analyzer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: analyzer
+  labels:
+    app.kubernetes.io/component: app
+spec:
+  type: ClusterIP
+  selector:
+    app: analyzer
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: analyzer
+  labels:
+    app.kubernetes.io/component: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: analyzer

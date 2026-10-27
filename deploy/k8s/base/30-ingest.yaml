@@ -1,0 +1,200 @@
+# -----------------------------------------------------------------------------
+# 30. ingest: receives test results from CI and stores them (the bursty write
+# path). Four objects: a Deployment (the pods), a Service (their stable address),
+# a HorizontalPodAutoscaler (adds pods under load) and a PodDisruptionBudget
+# (keeps pods alive during node maintenance). 31-api.yaml has the same shape.
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+  labels:
+    app.kubernetes.io/component: app
+  annotations:
+    # Shown by `kubectl rollout history`; scripts/k8s/deploy.sh sets it per release.
+    kubernetes.io/change-cause: "initial deployment"
+spec:
+  replicas: 2                          # the HPA below changes this between 2 and 8
+  revisionHistoryLimit: 10             # old versions kept for `kubectl rollout undo`
+  selector:
+    matchLabels:
+      app: ingest
+  # Rolling update that NEVER reduces capacity: start one extra new pod, wait until
+  # it is Ready, only then stop an old one. A broken new version therefore never
+  # replaces working pods (the "bad v3" rollout demo: it stalls, old pods keep serving).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: ingest
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532               # the "nonroot" user in the distroless image
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread the copies over different nodes, so losing one node never takes all
+      # of them. "ScheduleAnyway" = a preference, not a hard rule, so pods still
+      # start when the cluster is nearly full.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: ingest
+      containers:
+        - name: ingest
+          image: flaketracker/ingest:local     # kustomize overlays replace this (never :latest)
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          # All the shared, non-secret settings from 01-configmap.yaml.
+          envFrom:
+            - configMapRef:
+                name: flaketracker-config
+          # This service's OWN database only.
+          env:
+            - name: DB_HOST
+              value: ingest-db
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: ingest
+            - name: DB_USER
+              value: ingest
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ingest-db-credentials
+                  key: password
+            - name: INGEST_API_KEY       # the key CI must send in X-API-Key
+              valueFrom:
+                secretKeyRef:
+                  name: ingest-api-key
+                  key: api-key
+          # The HPA computes "CPU %" against `requests`, so requests MUST be set or
+          # autoscaling does nothing. They are deliberately SMALL (50m): an e2-medium node has
+          # only ~940m of CPU to hand out and GKE's own system pods already reserve about
+          # 400m of it, so larger requests left no room to absorb a drained node's pods or to
+          # scale out (found by draining a node on the real cluster: pods stayed Pending with
+          # "Insufficient cpu"). A small request also makes the autoscaler react to a modest
+          # load. The LIMITS below are unchanged, so a busy pod can still burst well above its request.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true     # a Go server needs no writable disk
+            capabilities:
+              drop: ["ALL"]
+          # Ready = may receive traffic. /readyz also pings the database, so a pod that
+          # can't reach its database is taken out of the Service instead of failing requests.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Alive = restart me if this keeps failing. /healthz never touches the database.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # When a pod is deleted, Kubernetes stops routing to it and sends it SIGTERM
+          # at the same moment. Waiting 5 s first lets every node finish updating its
+          # routing, so no request is sent to a pod that's already shutting down. The
+          # app then finishes in-flight requests itself (graceful shutdown).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+
+---
+# The Service: one stable name (http://ingest) and virtual IP in front of whatever
+# pods exist right now; requests are spread across them. Port 80 -> pod port 8080.
+# It serves both the Ingress (public /ingest/ path) and in-cluster callers
+# (analyzer's /internal/ calls, which are never exposed publicly).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest
+  labels:
+    app.kubernetes.io/component: app
+spec:
+  type: ClusterIP
+  selector:
+    app: ingest
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+---
+# Autoscaling: keep average CPU near 60% of the requested 100m by adding pods
+# (up to 8) when busy and removing them (down to 2) when idle. GKE has
+# metrics-server built in, which supplies the CPU numbers.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingest
+  labels:
+    app.kubernetes.io/component: app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingest
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:                           # react quickly to a burst
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:                         # but shrink back in ~2 minutes, so the demo shows both directions
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+
+---
+# PodDisruptionBudget: during VOLUNTARY disruptions (kubectl drain, node upgrades)
+# keep at least one copy running, so draining a node never takes ingest down.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingest
+  labels:
+    app.kubernetes.io/component: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ingest

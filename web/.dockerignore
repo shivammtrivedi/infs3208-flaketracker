@@ -1,0 +1,7 @@
+# The web image builds from the web/ folder. Keep the local node_modules and
+# previous build output out of the build context (npm ci recreates them inside
+# the image, for the right operating system).
+node_modules
+dist
+.vite
+*.log

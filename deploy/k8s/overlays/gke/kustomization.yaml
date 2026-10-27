@@ -1,0 +1,46 @@
+# The GKE overlay: the base manifests plus everything specific to Google Cloud:
+# the Ingress (a real Google Cloud HTTP(S) load balancer on a reserved static IP)
+# and the health-check settings that load balancer needs.
+#
+# Image names/tags are NOT set here. scripts/k8s/deploy.sh generates a small
+# overlays/_release/ folder (git-ignored) on top of this one that points every
+# image at Artifact Registry with the git-SHA tag being released, so a release
+# is always a specific, recorded set of tags (never :latest).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# A kustomization's namespace applies only to the files IT lists. The base sets it for the
+# base files, so each overlay must set it again for the objects the overlay adds, or they
+# land in the 'default' namespace instead (and can't find the Services they route to).
+namespace: flaketracker
+
+resources:
+  - ../../base
+  - backendconfigs.yaml
+  - ingress.yaml
+
+# Attach a BackendConfig to each Service the Ingress routes to, and ask GKE for
+# container-native load balancing ("NEG"): the load balancer sends traffic
+# straight to pod IPs instead of via an extra hop through the nodes.
+patches:
+  - target: {kind: Service, name: ingest}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          cloud.google.com/backend-config: '{"default": "ingest"}'
+          cloud.google.com/neg: '{"ingress": true}'
+  - target: {kind: Service, name: api}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          cloud.google.com/backend-config: '{"default": "api"}'
+          cloud.google.com/neg: '{"ingress": true}'
+  - target: {kind: Service, name: web}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          cloud.google.com/backend-config: '{"default": "web"}'
+          cloud.google.com/neg: '{"ingress": true}'

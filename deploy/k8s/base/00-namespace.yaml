@@ -1,0 +1,21 @@
+# FlakeTracker Kubernetes manifests: the BASE shared by every environment.
+# Environment-specific parts live in ../overlays/local (a free Kind cluster for
+# rehearsal) and ../overlays/gke (the real cloud deployment: Ingress, registry images).
+#
+# Object numbering: 00 namespace, 01 settings, 10-12 databases, 20 migrations,
+# 30-33 application services.
+#
+# Passwords are NOT in these files. The Secrets they refer to (ingest-db-credentials,
+# analyzer-db-credentials, api-db-credentials, ingest-api-key) are created on the
+# cluster by scripts/k8s/create-secrets.sh and never committed.
+
+# -----------------------------------------------------------------------------
+# 0. Namespace: one box that holds everything, so it can be listed, inspected or
+# deleted as a unit (kubectl get all -n flaketracker).
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flaketracker
+  labels:
+    app.kubernetes.io/component: config

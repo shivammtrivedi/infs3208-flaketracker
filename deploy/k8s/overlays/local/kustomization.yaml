@@ -1,0 +1,16 @@
+# The LOCAL overlay: the base manifests plus a small "edge" nginx standing in for
+# the cloud Ingress, for rehearsing on a free Kind cluster (scripts/k8s/local-rehearsal.sh).
+# Images are the locally built flaketracker/<service>:local, loaded into Kind with
+# `kind load docker-image`, so nothing needs changing from the base.
+#   kubectl apply -k deploy/k8s/overlays/local
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# A kustomization's namespace applies only to the files IT lists. The base sets it for the
+# base files, so each overlay must set it again for the objects the overlay adds, or they
+# land in the 'default' namespace instead (and can't find the Services they route to).
+namespace: flaketracker
+
+resources:
+  - ../../base
+  - edge.yaml

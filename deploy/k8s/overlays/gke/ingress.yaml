@@ -1,0 +1,54 @@
+# -----------------------------------------------------------------------------
+# 41. Ingress: ONE public address that routes by URL path. On GKE this makes
+# Google create a real Cloud HTTP(S) Load Balancer (a forwarding rule, URL map,
+# backend services and health checks). Provisioning takes several minutes after
+# `kubectl apply`; don't start debugging before the ADDRESS shows up and the
+# backends turn healthy (kubectl describe ingress flaketracker).
+#
+#   /api/*     -> api service      (the dashboard's API)
+#   /ingest/*  -> ingest service   (CI posts test results here; needs the API key)
+#   everything else -> web         (the dashboard)
+#
+# /internal/* is NOT listed on purpose. Those endpoints (analyzer <-> ingest <-> api)
+# stay reachable only inside the cluster; from outside they fall through to web.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flaketracker
+  labels:
+    app.kubernetes.io/component: ingress
+  annotations:
+    kubernetes.io/ingress.class: "gce"                        # the GKE external load balancer
+    # Use the reserved static IP, created once with:
+    #   gcloud compute addresses create flaketracker-ip --global
+    # so the public address survives deleting and re-creating this Ingress
+    # (the README, load-test and seed commands never change). HTTP only: HTTPS
+    # would need a domain name and certificate.
+    kubernetes.io/ingress.global-static-ip-name: flaketracker-ip
+    kubernetes.io/ingress.allow-http: "true"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+          - path: /ingest
+            pathType: Prefix
+            backend:
+              service:
+                name: ingest
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80

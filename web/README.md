@@ -1,32 +1,51 @@
-# React + TypeScript + Vite
+# FlakeTracker web dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React + TypeScript single-page app (Vite). It only ever talks to the `api` service, through relative `/api/...` URLs. In development Vite proxies those to the api service; in the cloud the Ingress does.
 
-Currently, two official plugins are available:
+## Pages
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| Page | URL | What it does |
+|---|---|---|
+| Overview (F1) | `/` | Headline numbers, flaky/broken tests over the last 30 days, the five flakiest tests. Refreshes itself every 10 s |
+| Leaderboard (F2) | `/tests` | All tests ranked by flakiness score; search, repository and status filters, pagination (filters live in the URL, so a filtered view is a shareable link) |
+| Test detail (F3) | `/tests/:id` | Score breakdown, pass/fail timeline, duration trend, recent runs with CI links, and quarantine / release (F4) |
+| Runs (F5) | `/runs` | CI runs with pass/fail bars; repository and branch filters |
+| Run detail (F5) | `/runs/:id` | One run's results, failures and retries first |
+| Quarantine (F4) | `/quarantine` | Every quarantined test, with a Release button |
 
-## React Compiler
+The footer shows which `api` and `analyzer` builds are live and which scoring algorithm (`v1`/`v2`) is running. It re-checks every 10 s, so a rollout or rollback appears on screen without a refresh.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+If a backend service is down, only the parts of a page that need it show an error; the rest of the dashboard keeps working (the overview shows a "reduced mode" banner).
 
-## Expanding the Oxlint configuration
+## Code layout
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```
+src/
+  api/types.ts        TypeScript types mirroring the Go API's JSON
+  api/client.ts       fetch wrapper (ApiError carries the HTTP status)
+  api/hooks.ts        one TanStack Query hook per endpoint, plus quarantine mutations
+  useUrlFilters.ts    keeps filters in the URL query string
+  format.ts           date / number / label helpers
+  components/         Layout (header + footer) and shared UI (badges, error/loading states, pagination)
+  pages/              one file per page above
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Commands
+
+```bash
+# Install the dependencies listed in package.json (run once, from this web/ folder).
+npm install
+
+# Start the dev server on http://localhost:5173 with hot reload.
+# Requests to /api are proxied to the api service on http://localhost:8092.
+npm run dev
+
+# Same, but proxy /api to a different api address (the variable is read by vite.config.ts).
+API_PROXY_TARGET=http://localhost:9000 npm run dev
+
+# Type-check with tsc, then build the production bundle into dist/ (what the nginx image serves).
+npm run build
+
+# Lint the source with oxlint.
+npm run lint
+```

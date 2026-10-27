@@ -1,0 +1,56 @@
+# A one-off Job that loads the 135,000-result demo data into ingest-db, from inside
+# the cluster, so the database never needs a public address. It is NOT part of
+# the normal deployment (not listed in any kustomization): run it on demand with
+#   scripts/k8s/seed.sh local        (or: scripts/k8s/seed.sh gke <TAG>)
+# SEED_IMAGE is a placeholder that seed.sh replaces with the real image name.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: flaketracker
+spec:
+  backoffLimit: 0                  # a failed load should be looked at, not silently retried
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: seed
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: SEED_IMAGE
+          imagePullPolicy: IfNotPresent
+          # --mode=db     bulk-insert straight into ingest-db (fast)
+          # --truncate    empty ingest-db's tables first, so re-running is safe
+          args: ["--mode=db", "--truncate"]
+          env:
+            - name: DB_HOST
+              value: ingest-db
+            - name: DB_NAME
+              value: ingest
+            - name: DB_USER
+              value: ingest
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ingest-db-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi        # the generator holds all 135,000 rows in memory before the bulk insert
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,69 @@
+# -----------------------------------------------------------------------------
+# 40. BackendConfig: extra settings for the Google load balancer, one per Service
+# the Ingress routes to (ingest, api, web). analyzer has none: it isn't routed.
+#
+# The load balancer runs its OWN health checks against every backend and marks
+# a backend "unhealthy" unless it gets a 200. Without an explicit path it
+# checks "/", which our Go services don't serve (it would 404 and every
+# backend would be marked unhealthy: the classic GKE Ingress gotcha). So we
+# point it at /healthz, which all three services answer with 200.
+# Attached to each Service by the annotation added in kustomization.yaml.
+# -----------------------------------------------------------------------------
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: ingest
+  labels:
+    app.kubernetes.io/component: ingress
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 8080                  # the pod's port (container-native load balancing checks the pod directly)
+    checkIntervalSec: 5
+    timeoutSec: 3
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+  timeoutSec: 30                # how long the load balancer waits for a response
+  connectionDraining:
+    drainingTimeoutSec: 30      # let in-flight requests finish when a pod is removed
+
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/component: ingress
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 8080
+    checkIntervalSec: 5
+    timeoutSec: 3
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+  timeoutSec: 30
+  connectionDraining:
+    drainingTimeoutSec: 30
+
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/component: ingress
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz       # served by nginx (web/nginx.conf)
+    port: 8080
+    checkIntervalSec: 5
+    timeoutSec: 3
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+  timeoutSec: 30
+  connectionDraining:
+    drainingTimeoutSec: 30

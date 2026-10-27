@@ -1,0 +1,13 @@
+# A local Kubernetes cluster for rehearsing the deployment for free: Kind runs
+# each "node" as a Docker container. One control-plane node plus three workers
+# mirrors the three-node GKE cluster, so pod spreading, node drains and
+# pod-disruption budgets behave the same way as in the cloud.
+# Create it with: kind create cluster --config deploy/k8s/kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: flaketracker
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

@@ -1,0 +1,36 @@
+# -----------------------------------------------------------------------------
+# 1. Shared settings (non-secret). Every application service reads these as
+# environment variables (envFrom). Changing a value here needs no image rebuild:
+# edit, `kubectl apply`, and restart the pods that use it.
+#
+# Database settings are deliberately NOT here. Under database-per-service each
+# service gets only ITS OWN database's host/name/user/password, set on that
+# service's own Deployment, so a service cannot even be pointed at another's data.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flaketracker-config
+  labels:
+    app.kubernetes.io/component: config
+data:
+  # --- how services find each other (Kubernetes Service names, port 80) ---
+  INGEST_URL: "http://ingest"
+  ANALYZER_URL: "http://analyzer"
+  # How long api waits for ingest/analyzer before answering 503 for that endpoint.
+  DOWNSTREAM_TIMEOUT: "3s"
+
+  # --- flakiness scoring (analyzer), see Section 10 of the project plan ---
+  WINDOW_SIZE: "30"            # how many recent results are scored per test
+  MIN_SAMPLES: "5"             # fewer results than this -> "not enough data"
+  BROKEN_STREAK: "5"           # this many failures in a row -> broken
+  FLAKY_THRESHOLD: "0.15"      # score at or above this -> flaky
+  HALF_LIFE_DAYS: "1.5"        # v2 only: a result's weight halves every 1.5 days
+  EVIDENCE_THRESHOLD: "0.5"    # v2 only: weighted retry-pass evidence needed -> flaky
+
+  # --- analyzer cycle and the ingest -> analyzer results feed ---
+  ANALYZER_INTERVAL: "15s"     # how often the leader scores tests
+  FEED_LAG: "10s"              # ingest only hands out results at least this old (must be >= 2x its 4s insert timeout)
+  FEED_PAGE_SIZE: "5000"       # results requested per feed page
+  FEED_MAX_PAGES: "50"         # cap per cycle
+  RESCORE_BATCH: "1000"        # tests re-scored per cycle after a version change

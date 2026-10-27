@@ -1,0 +1,168 @@
+# -----------------------------------------------------------------------------
+# 20. Database migrations: one Job per database. A Job runs a pod to COMPLETION
+# (unlike a Deployment, which keeps pods running forever): it creates the tables
+# and exits. Same image three times, each pointed at a different database.
+#
+# Two things to know:
+#  * A Job's pod template can't be edited once created. When the image tag changes,
+#    scripts/k8s/deploy.sh deletes the old Jobs first and applies fresh ones.
+#  * Migrations are idempotent ("already up to date" counts as success), so
+#    running them again on every deploy is harmless.
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-ingest
+  labels:
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 8                      # retry a failed pod up to 8 times (e.g. while the database is still starting)
+  activeDeadlineSeconds: 600           # give up entirely after 10 minutes
+  ttlSecondsAfterFinished: 86400       # tidy the finished Job away after a day
+  template:
+    metadata:
+      labels:
+        app: migrate-ingest
+    spec:
+      restartPolicy: OnFailure         # Jobs must be OnFailure or Never; retry in place
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532               # the "nonroot" user in the distroless image
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: flaketracker/migrate:local
+          imagePullPolicy: IfNotPresent
+          args: ["--service=ingest"]   # which service's migrations to apply (db/migrations/ingest)
+          env:
+            - name: DB_HOST
+              value: ingest-db
+            - name: DB_NAME
+              value: ingest
+            - name: DB_USER
+              value: ingest
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ingest-db-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-analyzer
+  labels:
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 8
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: migrate-analyzer
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: flaketracker/migrate:local
+          imagePullPolicy: IfNotPresent
+          args: ["--service=analyzer"]
+          env:
+            - name: DB_HOST
+              value: analyzer-db
+            - name: DB_NAME
+              value: analyzer
+            - name: DB_USER
+              value: analyzer
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: analyzer-db-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-api
+  labels:
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 8
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: migrate-api
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: flaketracker/migrate:local
+          imagePullPolicy: IfNotPresent
+          args: ["--service=api"]
+          env:
+            - name: DB_HOST
+              value: api-db
+            - name: DB_NAME
+              value: api
+            - name: DB_USER
+              value: api
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-db-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
