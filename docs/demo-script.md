@@ -10,8 +10,8 @@ Values used below (all measured on GKE on 2026-10-20; re-time them in your rehea
 |---|---|
 | Public address | `http://34.96.64.67` |
 | Image tag now deployed | `oct20-1` (analyzer v2 image: `oct20-1-v2`, already in the registry) |
-| Demo data | 74 flaky, 15 broken, 361 stable (algorithm v1); 50 flaky under v2 |
-| Autoscaling seen | `ingest` 2 -> 5 pods in under 40 s, back down about 2.5 min after the load stops |
+| Demo data | 74 flaky, 15 broken, 361 stable under v1. **Under v2 the flaky count shrinks a little more each day** (50 on 2026-10-20, 19 on 2026-10-28) because v2 counts old results less and the seeded history keeps getting older. Read the real v2 number off the screen in your rehearsal and quote that. |
+| Autoscaling seen | `ingest` 2 -> 5 pods in under 40 s on 2026-10-20. In the 24-worker run: 2 -> 3 -> 6 -> 7 -> 8 pods (the maximum), CPU 74% -> 345% -> about 120% at 8 pods. About 2 minutes after the load stops it steps down 8 -> 6 -> 4 -> 2. |
 | Rollout seen | analyzer v2 rolled out in about 7 s, visible on the dashboard after about 22 s |
 
 ---
@@ -19,23 +19,37 @@ Values used below (all measured on GKE on 2026-10-20; re-time them in your rehea
 ## 1. Before the demo (start 25 minutes early)
 
 ```bash
+# 0. Only on a fresh clone (e.g. a Mac): git on Windows does not store the "executable" flag,
+#    so give every script the execute permission once.  find ... -exec chmod +x  adds it to each .sh file.
+find scripts -name '*.sh' -exec chmod +x {} +
+
 # 1. Start the cluster: 3 VMs, then the databases, then the services (about 5 minutes).
 #    It asks y/N first; ASSUME_YES=1 answers yes for you.
+#    EXPECT: it ends by listing every pod as Running, then "The load balancer is still there...".
+#    If it prints nothing and stops at once, gcloud is missing or not signed in (see section 4).
 ASSUME_YES=1 scripts/gcp/scale-up.sh
 
 # 2. Every pod should be Running and READY (databases 1/1, services 2/2 copies).
 #    -n flaketracker = our namespace;  -o wide = also show which node each pod is on.
+#    EXPECT: 11 pods Running with READY 1/1 (8 service pods + 3 databases), spread over the 3 nodes.
+#    (Any "Completed" pods are finished database-migration jobs, which is normal.)
 kubectl -n flaketracker get pods -o wide
 
 # 3. The public address must answer 200. If you see 502, wait 1-2 minutes and retry.
 #    -s silent;  -o /dev/null throw the page away;  -w '%{http_code}' print only the status code.
+#    EXPECT: 200
 curl -s -o /dev/null -w '%{http_code}\n' http://34.96.64.67/healthz
 
 # 4. The data survived: the summary should show 450 tests (74 flaky, 15 broken, 361 stable).
+#    EXPECT: "algorithm_version":"v1", "tests_tracked":450, flaky 74, broken 15, stable 361.
+#    If it says v2, the analyzer is still on the v2 image: see section 9 (reset).
 curl -s http://34.96.64.67/api/v1/summary
 
 # 5. Put the ingest API key in a variable (it is never printed on screen).
-KEY=$(kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 -d)
+#    --decode (not -d) works on both Mac and Windows/Linux.
+#    The variable only exists in THIS terminal window: set it again in any new window (Terminal C).
+KEY=$(kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 --decode)
+echo "${#KEY}"      # EXPECT: a number above 0 (the key's length). 0 means kubectl cannot reach the cluster.
 
 # 6. The registry path used by the rollout commands.
 REGISTRY=australia-southeast2-docker.pkg.dev/$(gcloud config get-value project)/flaketracker
@@ -48,9 +62,11 @@ Open three terminal windows and one browser, with these ready but **not yet run*
 | Browser | `http://34.96.64.67` on the Overview page |
 | Terminal A (main) | the `kubectl` commands in section 2 |
 | Terminal B | `kubectl -n flaketracker get hpa -w` (the autoscaler watch) |
-| Terminal C | the load test command (start it at 2:00) |
+| Terminal C | the load test command (start it at 2:00). Set `KEY` in **this** window too (step 5 above): a variable is not shared between windows. |
 
 Check the dashboard shows **v1** in the footer, and no test is quarantined.
+
+**Use the same address everywhere:** `http://34.96.64.67` (the reserved IP; it does not change when you scale down and up).
 
 ---
 
@@ -66,6 +82,8 @@ Check the dashboard shows **v1** in the footer, and no test is quarantined.
 3. **Test detail** (15 s): open the top test. Show the score breakdown, the pass/fail timeline and the duration chart.
 4. **Quarantine** (10 s): quarantine that test with a reason, show it appear, then release it so the counts go back.
 5. **Scoring** (5 s): point at the footer (algorithm v1, commit). "The scoring algorithm is part of the image; we change it live later."
+
+**What to look for (browser):** Overview totals 450 tests / 74 flaky / 15 broken, quarantined 0 at the start; after you quarantine a test the Quarantine page lists it and the Overview "quarantined" count goes to 1, and back to 0 after Release. Every page loads within a second or two with no error banner.
 
 ### 1:00 - 2:00  Tech stack (show the architecture diagram)
 
@@ -83,7 +101,10 @@ Point at the diagram: browser -> load balancer -> `web` / `api` / `ingest`; `api
 scripts/loadtest/ingest-load.sh http://34.96.64.67 "$KEY" 24 120
 ```
 
-Start Terminal B's watch as well (`kubectl -n flaketracker get hpa -w`), then in Terminal A:
+**What to look for in Terminal C:** nothing is printed while it runs (about 2 minutes). If you get `usage: ingest-load.sh ...` at once, `$KEY` is empty in this window: set it again. At the end it prints one line:
+`requests: <thousands>   errors (non-200): <about 0>   average rate: <req/s>` (an earlier run: 7,678 requests, about 64 req/s). A tiny error count (a handful out of thousands, mostly around the pod you delete) is expected; read the number out.
+
+Start Terminal B's watch as well (`kubectl -n flaketracker get hpa -w`). **What to look for in Terminal B** is in the 3:10 section below. Then in Terminal A:
 
 ```bash
 # One cluster, three nodes.
@@ -98,6 +119,11 @@ kubectl -n flaketracker get deploy,sts
 
 *Say:* "One zonal GKE cluster with three e2-medium nodes. Four services run independently, and each data service has its own database pod, so they scale, fail and update on their own."
 
+**What to look for (Terminal A):**
+- `get nodes`: **3 nodes**, all `Ready`, names starting `gke-flaketracker-default-pool-`.
+- `get pods -o wide`: the NODE column shows each service's two copies on **different** nodes; databases are `ingest-db-0`, `analyzer-db-0`, `api-db-0`. While the load runs you will already see extra `ingest` pods appearing (the autoscaler at work).
+- `get deploy,sts`: Deployments `ingest api analyzer web` (READY 2/2 or more for ingest) and StatefulSets `ingest-db analyzer-db api-db` (READY 1/1). Four independent services plus three databases: this is the "show all microservices running independently" point.
+
 ### 2:40 - 3:10  Orchestration and load balancing
 
 ```bash
@@ -111,20 +137,49 @@ kubectl -n flaketracker get ingress flaketracker
 
 *Say:* "Kubernetes runs the whole system from YAML. The Ingress creates a Google HTTP load balancer that routes `/`, `/api` and `/ingest` to the right service, and each Service then spreads requests across that service's pods." (Optionally show `deploy/k8s/base/30-ingest.yaml` in the editor for five seconds.)
 
+**What to look for (Terminal A):**
+- The long `get` lists every kind of object: Deployments, StatefulSets, Services (`ingest`, `api`, `analyzer`, `web` and the three databases), the Ingress, two HPAs (`ingest` 2-8, `api` 2-6), and PodDisruptionBudgets for the four services. The migration Jobs delete themselves after they finish, so the Jobs list is probably empty now: that is normal. Seven Services are listed: `ingest`, `api`, `analyzer`, `web`, plus one per database (`CLUSTER-IP None`).
+- `get ingress flaketracker`: **ADDRESS `34.96.64.67`**, PORTS `80`. That address is the Google load balancer; point at it and at the same address in the browser bar.
+- Optional in the GCP console: Network services > Load balancing shows the same load balancer with healthy backends.
+
 ### 3:10 - 4:00  Scalability and reliability (Terminals B and A)
 
 1. **Scalability:** show Terminal B. The `ingest` autoscaler's TARGETS climb past 60% and REPLICAS rises (2 -> 5 or more).
    *Say:* "A Horizontal Pod Autoscaler adds pods when CPU passes 60%, and removes them afterwards."
+
+   **What to look for in Terminal B** (a new line prints each time a value changes). Columns: `TARGETS` is `current CPU / goal`; the goal is 60% of the small CPU each pod asks for (50m), so 300%+ is normal for a tiny request. A real run looked like this:
+
+   | Step | `ingest` TARGETS | REPLICAS | What it means |
+   |---|---|---|---|
+   | Quiet before the load | `1%/60%` | 2 | the minimum |
+   | Load starts | `74%/60%` | 2 -> 3 | over the goal, so it adds a pod |
+   | Load is heavy | `345%/60%` | 3 -> 6 -> 7 -> 8 | it adds several pods at once |
+   | At the maximum | about `115-126%/60%` | 8 | capped at 8 on purpose (cost control), still a bit hot |
+   | Load has stopped | `1%/60%` | 8 for about 2 minutes | it waits so it doesn't flap up and down |
+   | Scale back down | `1%/60%` | 8 -> 6 -> 4 -> 2 | steps of one half every 30 s |
+
+   Also look at the `api` row: it stays at **2 replicas, 1-3% CPU** the whole time, because the test only hits `ingest`. Each service scales on its own.
+
+   **Timing warning:** the load starts at 2:00 and stops at about 4:00, and the scale-**down** only begins about 2 minutes after that. It will **not** finish inside the 6 minutes. Say "it grows to 8 and shrinks back to 2 after the load ends", and show the scale-down from the **screenshot of this table or the backup video**, or look at the terminal again during questions. Re-time the scale-up in your rehearsal (on 2026-10-20 it went 2 -> 5 in under 40 s).
 2. **Reliability:** while the load is running, delete a pod:
 
 ```bash
-# Delete one ingest pod under traffic. Kubernetes replaces it, and the other replicas keep serving.
-# --wait=false returns immediately instead of waiting for the pod to go away.
-kubectl -n flaketracker delete pod -l app=ingest --wait=false
+# Delete exactly ONE ingest pod under traffic. Kubernetes replaces it, and the other replicas keep serving.
+#   get pods -l app=ingest -o name   lists the ingest pods as "pod/<name>"
+#   head -n 1                        keeps only the first one
+#   --wait=false                     returns immediately instead of waiting for the pod to go away
+# (Do NOT use "delete pod -l app=ingest": that deletes every ingest pod at once and ingest goes down.)
+kubectl -n flaketracker delete $(kubectl -n flaketracker get pods -l app=ingest -o name | head -n 1) --wait=false
+
+# Look at the ingest pods straight afterwards.
+# -l app=ingest picks only the ingest pods.
+kubectl -n flaketracker get pods -l app=ingest
 ```
 
    *Say:* "Every service runs at least two replicas across nodes, with health checks and disruption budgets, so losing a pod or a node doesn't take the site down. If one database is lost, only the pages that need it show an error."
-3. Refresh the dashboard to show it still works. At about 4:00 the load finishes and Terminal C prints the totals; read the error count out ("about zero").
+
+   **What to look for (Terminal A):** the delete prints one line, `pod "ingest-..." deleted`. The next `get pods` shows that pod as `Terminating` and **a new one already started** (`ContainerCreating`, then `Running` and `1/1` within seconds to about 30 s), while all the other ingest pods stay `Running 1/1`. The count goes back up on its own, and the autoscaler keeps adding more while the load lasts. Terminal C's error count stays tiny because the other pods kept answering.
+3. Refresh the dashboard to show it still works (no error banner, pages load). At about 4:00 the load finishes and Terminal C prints the totals; read the error count out (a handful out of thousands is expected, "about zero").
 
 ### 4:00 - 5:30  Rollout and rollback (Terminal A, then browser)
 
@@ -138,8 +193,13 @@ kubectl -n flaketracker set image deployment/analyzer analyzer=$REGISTRY/analyze
 kubectl -n flaketracker rollout status deployment/analyzer
 ```
 
-Refresh the browser after about 20 seconds: the footer now says **algorithm v2** and the flaky count drops from 74 to 50.
+Refresh the browser after about 20 seconds: the footer now says **algorithm v2** and the flaky count drops from 74 to a lower number (19 when last checked on 2026-10-28; read the real figure off the screen).
 *Say:* "A different algorithm is a different image, rolled out with zero downtime."
+
+**What to look for (Terminal A, then browser):**
+- `rollout status` prints lines like `Waiting for deployment "analyzer" rollout to finish: 1 out of 2 new replicas have been updated...` and ends with **`deployment "analyzer" successfully rolled out`** after about 7-10 s. Old pods are only removed once new ones are ready, so the analyzer never has zero pods.
+- Browser: the footer changes from v1 to **v2**, the flaky number on Overview and the Leaderboard drops, and no page ever shows an error during the change. The dashboard may take 20-30 s to show it, because the analyzer re-scores on a 15 s cycle.
+- Optional check: `curl -s http://34.96.64.67/api/v1/version` shows `"analyzer":{"commit":"oct20-1-v2","algorithm_version":"v2"}`.
 
 ```bash
 # --- Rollback: a deliberately broken release ---
@@ -153,11 +213,20 @@ kubectl -n flaketracker get pods -l app=api
 # One command puts the previous working version back.
 kubectl -n flaketracker rollout undo deployment/api
 
+# Write the reason AFTER the undo. Kubernetes copies the Deployment's current note onto the restored
+# revision, so without this line the good revision would still be labelled "bad release".
+kubectl -n flaketracker annotate deployment/api kubernetes.io/change-cause="rolled back: restored api oct20-1" --overwrite
+
 # The history of revisions, each with the reason it was made.
 kubectl -n flaketracker rollout history deployment/api
 ```
 
 *Say:* "Images are tagged with their Git commit. A bad release stalls instead of causing an outage, because new pods must be healthy before old ones are removed, and `rollout undo` restores the last good version in one command."
+
+**What to look for (Terminal A and browser):**
+- `get pods -l app=api` after the bad image: **three** pods, two `Running 1/1` (the old good ones, about an hour or more old) and one **new** pod showing `ErrImagePull` and then `ImagePullBackOff`, READY `0/1`. The point to make: the broken pod never takes traffic, so the dashboard keeps working (refresh it to prove it).
+- `rollout undo` prints `deployment.apps/api rolled back`. Run `get pods -l app=api` again and the broken pod is gone, leaving two healthy pods.
+- `rollout history` shows a table of REVISION and CHANGE-CAUSE rows. Expect your reason texts: the original release note (`release oct20-1 to gke...`), `bad release: missing image` for the broken revision, and the `rolled back: ...` note on the restored one. Revision numbers may have gaps (for example 1, 5, 6) because of earlier rehearsals; that is normal and not an error.
 
 ### 5:30 - 6:00  Wrap-up
 
@@ -177,7 +246,10 @@ kubectl -n flaketracker rollout history deployment/api
 |---|---|
 | Site returns 502 | Wait 1-2 minutes; the load balancer is re-checking pods. |
 | The autoscaler hasn't scaled | Say "it checks every 15 s" and show the earlier screenshot or the backup video. |
-| `kubectl` can't connect | `gcloud container clusters get-credentials flaketracker --zone australia-southeast2-b` |
+| `kubectl` can't connect | `gcloud container clusters get-credentials flaketracker --zone australia-southeast2-b --project infs3200-project` |
+| `permission denied: scripts/gcp/scale-up.sh` | The scripts lost their execute flag (clone from Windows): `find scripts -name '*.sh' -exec chmod +x {} +` |
+| `scale-up.sh` prints nothing and stops at once | `gcloud` is not installed or not on the PATH (the script quits silently on its first line). Check `command -v gcloud kubectl gke-gcloud-auth-plugin`; trace with `bash -x scripts/gcp/scale-up.sh`. |
+| Load test prints `usage: ingest-load.sh ...` | `$KEY` is empty in that window. Set it again (section 1, step 5); a variable is not shared between terminal windows. |
 | Cluster won't start at all | Play the **backup video**. (The local Docker Compose stack runs the same app, but a local-only demo loses marks.) |
 | A dashboard page shows an error | Say "only that service's data is unavailable; the rest of the app is up": that is the failure isolation. |
 
@@ -416,13 +488,44 @@ curl -s -X POST http://34.96.64.67/ingest/v1/runs \
 
 ---
 
-## 9. After the demo (put it all back)
+## 9. Reset to a fresh state (after a rehearsal, and after the demo)
+
+The data is never changed by the demo, so a reset only has to put the **analyzer back on v1** and
+fix the api's history label. Run it after every rehearsal, and check before the real demo.
 
 ```bash
-# Put the analyzer back on v1 so the next run starts the same way.
-kubectl -n flaketracker set image deployment/analyzer analyzer=$REGISTRY/analyzer:oct20-1
-kubectl -n flaketracker annotate deployment/analyzer kubernetes.io/change-cause="back to v1" --overwrite
+# 1. Write the reason BEFORE changing the image so the note lands on the new revision.
+kubectl -n flaketracker annotate deployment/analyzer kubernetes.io/change-cause="reset to v1 before demo" --overwrite
 
-# Stop the VMs so the cluster stops costing money (the app, its data and the load balancer stay).
+# 2. Put the analyzer back on the v1 image (pods are replaced one at a time, nothing goes down).
+kubectl -n flaketracker set image deployment/analyzer analyzer=$REGISTRY/analyzer:oct20-1
+
+# 3. Wait until the rollout finishes. EXPECT: deployment "analyzer" successfully rolled out
+kubectl -n flaketracker rollout status deployment/analyzer
+
+# 4. If the api was rolled back, relabel the restored revision (it still says "bad release").
+kubectl -n flaketracker annotate deployment/api kubernetes.io/change-cause="baseline: api oct20-1" --overwrite
+
+# 5. Wait about 30 s for the analyzer to rescore, then check.
+#    EXPECT: "algorithm_version":"v1", "tests_tracked":450, flaky 74, broken 15, stable 361
+curl -s http://34.96.64.67/api/v1/summary | head -c 300; echo
+#    EXPECT: "analyzer":{"commit":"oct20-1", ...,"algorithm_version":"v1"}
+curl -s http://34.96.64.67/api/v1/version; echo
+
+# 6. EXPECT: 2 pods of each service Running 1/1 and the databases Running 1/1; HPA rows at 2 replicas, about 1% CPU.
+kubectl -n flaketracker get pods
+kubectl -n flaketracker get hpa
+```
+
+Revision numbers in `rollout history` cannot be reset (Kubernetes only renumbers if the Deployment
+is deleted and recreated, which causes a short outage); gaps such as 1, 5, 6 are fine.
+If you ran the optional `demo/live-ci` curl in section 8, the summary will show 451 tests until the
+database is reseeded.
+
+**When you are completely finished,** stop the VMs so the cluster stops costing money (the app,
+its data and the load balancer stay):
+
+```bash
+# Scales the workloads to zero and the node pool to 0 VMs. Waits for pods to stop first.
 ASSUME_YES=1 scripts/gcp/scale-down.sh
 ```

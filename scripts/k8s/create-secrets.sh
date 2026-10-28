@@ -50,4 +50,4 @@ create_secret ingest-api-key          api-key  "${INGEST_API_KEY:-$(random)}"
 
 echo
 echo "Done. To read the ingest API key (needed by the seed tool and the load test):"
-echo "  kubectl -n $NAMESPACE get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 -d; echo"
+echo "  kubectl -n $NAMESPACE get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 --decode; echo"

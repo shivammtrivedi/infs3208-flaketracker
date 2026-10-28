@@ -118,8 +118,9 @@ kubectl -n flaketracker port-forward svc/edge 8080:80
 # See everything that is running, and which node each pod landed on.
 kubectl -n flaketracker get pods -o wide
 
-# Delete a pod while using the app: Kubernetes replaces it and nothing breaks.
-kubectl -n flaketracker delete pod -l app=api --wait=false
+# Delete exactly ONE api pod while using the app: Kubernetes replaces it and nothing breaks.
+#   get pods -l app=api -o name  lists the api pods as "pod/<name>";  head -n 1  keeps just the first.
+kubectl -n flaketracker delete $(kubectl -n flaketracker get pods -l app=api -o name | head -n 1) --wait=false
 
 # Remove the whole local cluster when finished.
 kind delete cluster --name flaketracker
@@ -169,15 +170,17 @@ kubectl -n flaketracker get ingress flaketracker
 ```bash
 # Get the ingest API key, then generate load: 24 parallel workers for 2 minutes. The requests replay an
 # existing run, so ingest does real work (decode + validate) but no data is changed.
-KEY=$(kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 -d)
+KEY=$(kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 --decode)
 scripts/loadtest/ingest-load.sh http://<ADDRESS> "$KEY" 24 120
 
 # In another terminal, watch the autoscaler add pods (it went from 2 to 5 replicas in under 40 seconds)
 # and remove them again about 2.5 minutes after the load stops.
 kubectl -n flaketracker get hpa ingest -w
 
-# Delete a pod while the dashboard is in use: Kubernetes replaces it, nothing breaks.
-kubectl -n flaketracker delete pod -l app=ingest --wait=false
+# Delete exactly ONE ingest pod while the dashboard is in use: Kubernetes replaces it, nothing breaks.
+#   get pods -l app=ingest -o name  lists the ingest pods as "pod/<name>";  head -n 1  keeps just the first.
+# (Plain "delete pod -l app=ingest" would delete every ingest pod at once.)
+kubectl -n flaketracker delete $(kubectl -n flaketracker get pods -l app=ingest -o name | head -n 1) --wait=false
 
 # Drain a node (move every pod off it, as before maintenance). The disruption budgets keep at least one
 # copy of each service running; a database on that node moves and is ready again in about 30 seconds.

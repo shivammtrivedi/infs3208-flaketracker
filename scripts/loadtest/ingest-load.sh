@@ -7,7 +7,7 @@
 #   e.g. scripts/loadtest/ingest-load.sh http://34.96.64.67 "$KEY" 24 120
 #
 # Get the API key with:
-#   kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 -d
+#   kubectl -n flaketracker get secret ingest-api-key -o jsonpath='{.data.api-key}' | base64 --decode
 #
 # What it sends: a realistic 150-test run, repeatedly, under the ID of a run that ALREADY
 # exists (seed42-r1-1 from the demo data). ingest has to read, decode and validate the whole
