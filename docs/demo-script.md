@@ -188,7 +188,7 @@ kubectl -n flaketracker rollout history deployment/api
 - **How does the analyzer avoid doing work twice with two replicas?** A PostgreSQL advisory lock elects one leader; the other waits.
 - **Why is ingest safe to retry?** A run's identity is unique, so a duplicate returns "200 duplicate" and nothing is written twice.
 - **Why not Cloud SQL?** In-cluster PostgreSQL is much cheaper for three small databases; the trade-off is no managed backups or automatic failover.
-- **Is the data real?** It is generated (seeded) so the demo is repeatable; it enters through the same ingest API a real CI pipeline would use.
+- **Is the data real?** It is generated (seeded) so the demo is repeatable; it enters through the same ingest API a real CI pipeline would use. Full answer in section 8; where each feature is in the code is section 7.
 - **Why HTTP and not HTTPS?** A managed certificate needs a domain name; in production we would terminate TLS at the load balancer.
 - **Do the nodes scale automatically?** Pods do. The node pool is a fixed three; a node autoscaler is the next step.
 
@@ -259,7 +259,164 @@ Costs are from the Google Cloud Pricing Calculator (Melbourne, 24/7). Re-check t
 
 Cost controls: the nodes scale to zero outside working hours (`scale-down.sh`), which cuts the real bill to roughly US$40 a month, and Spot would roughly halve the node cost for non-demo use.
 
-## 7. After the demo (put it all back)
+## 7. Where each feature lives in the code (if the tutor says "show me")
+
+Paths are from the repo root. Function names are given instead of line numbers because line
+numbers drift; in VS Code press `Ctrl+P`, type the file name, then `Ctrl+Shift+O` and type the function name.
+
+The backend is Go (`cmd/` = the program that starts each service, `internal/` = the logic).
+The dashboard is React + TypeScript (`web/src/`). Database tables are in `db/migrations/`.
+
+### The five features the dashboard shows
+
+| Feature | What it does (one sentence) | Backend logic | Dashboard page |
+|---|---|---|---|
+| **F1 Overview** | Shows the totals: tests, how many are flaky, broken or stable, runs, quarantined, and a trend over time. | `internal/api/handlers.go` `summary` (joins the three services' answers); `internal/analyzer/api.go` `Summary`; `internal/ingest/read.go` `Summary`; trend data is written by `internal/analyzer/cycle.go` `refreshDaily` into table `daily_flaky_counts` | `web/src/pages/Overview.tsx` |
+| **F2 Leaderboard** | Lists tests ranked by flakiness score, with filters, sorting and paging. | `internal/api/handlers.go` `listTests` (adds the quarantined flag); `internal/analyzer/api.go` `ListTests` (filter, sort and paging SQL) | `web/src/pages/Leaderboard.tsx`, filters kept in the URL by `web/src/useUrlFilters.ts` |
+| **F3 Test detail and history** | One test's score, its signals, its quarantine status and its last results over time. | `internal/api/handlers.go` `getTest` and `history`; `internal/ingest/read.go` `Test` and `History` | `web/src/pages/TestDetail.tsx` |
+| **F4 Quarantine** | Lets a person park a flaky test with a reason, list the parked tests, and release one. | `internal/api/handlers.go` `createQuarantine`, `listQuarantines`, `releaseQuarantine`; `internal/quarantine/store.go` (`Create`, `Release`, `Active`, `ActiveFor`, `CountActive`); table `quarantines` in `db/migrations/api/000001_init.up.sql` | `web/src/pages/Quarantine.tsx` (the list and Release); the Quarantine button is in `web/src/pages/TestDetail.tsx`; calls are in `web/src/api/hooks.ts` |
+| **F5 Run explorer** | Lists CI runs and shows each run's test results and retries. | `internal/api/handlers.go` `listRuns` and `getRun`; `internal/ingest/read.go` `Runs` and `Run`; index in `db/migrations/ingest/000002_run_explorer_index.up.sql` | `web/src/pages/Runs.tsx`, `web/src/pages/RunDetail.tsx` |
+
+If asked "where is the quarantine implemented?": the rules are in `internal/api/handlers.go`
+(`createQuarantine` checks the reason, asks ingest if the test exists, then saves), the saving
+is in `internal/quarantine/store.go`, and "a test can only be quarantined once at a time" is
+enforced by the database itself with the partial unique index `uq_active_quarantine`
+(`db/migrations/api/000001_init.up.sql`). The quarantine is a record in `api-db`; nothing in CI
+reads it yet, a pipeline would call `GET /api/v1/quarantine?repo=...` to get the list to skip.
+
+### The engine behind the features
+
+| Part | What it does | Files |
+|---|---|---|
+| **Ingestion** (the backbone) | Accepts a CI run as JSON, checks it, saves the run and all its test results in one transaction; a repeat of the same run is safe. | `cmd/ingest/main.go` (routes, API key check at startup); `internal/ingest/handler.go` `NewHandler` (5 MB cap, 400 with all problems, 202 new, 200 duplicate); `internal/ingest/payload.go` `Validate` and `DeriveResult` (final status, passed-on-retry); `internal/ingest/store.go` `Insert` (one transaction, `ON CONFLICT DO NOTHING`); `internal/httpx/httpx.go` `RequireAPIKey`; unique key `(repository_id, ci_run_id, ci_run_attempt)` in `db/migrations/ingest/000001_init.up.sql` |
+| **Feed from ingest to analyzer** | Hands the analyzer new results in order, never skipping one. | `internal/ingest/feed.go` `Feed` and `NewFeedHandler` (the 10 s lag); `internal/clients/ingest.go` |
+| **Flakiness scoring** | Turns a test's last 30 results into a score and a verdict: stable, flaky, broken or not enough data. v1 counts all results equally, v2 lets old results fade. | `internal/scoring/scoring.go` (`V1`, `V2`, `score`, `isBroken`); unit tests in `internal/scoring/scoring_test.go`; thresholds in `deploy/k8s/base/01-configmap.yaml` |
+| **Analyzer loop and leader election** | Every 15 s one elected replica pulls new results, re-scores the changed tests and saves them. | `internal/analyzer/analyzer.go` (`Run`, `tick`, `lead` = Postgres advisory lock); `internal/analyzer/cycle.go` (`Cycle`, `rescore`); `cmd/analyzer/main.go` |
+| **API gateway** | The one backend the dashboard talks to; it calls ingest and analyzer over HTTP and combines the answers. | `cmd/api/main.go`; `internal/api/server.go` (all routes in `Register`); `internal/clients/` (HTTP clients with timeouts and retries) |
+| **Failure isolation** | If one downstream service is down, only the endpoints that need it answer 503. | `internal/api/server.go` `downstreamError`; the `Degraded` field in `internal/api/handlers.go` |
+| **Health checks and shutdown** | Liveness (`/healthz`) and readiness (`/readyz`), and finishing in-flight requests on shutdown. | `internal/httpx/httpx.go` `Healthz`, `Readyz`; shutdown code at the end of each `cmd/*/main.go` |
+| **Demo data generator** | Makes the 450 tests and their history, then sends them through the real ingest API. | `cmd/seed/main.go`; `internal/seed/generate.go` `Generate`; `internal/seed/api.go` `PostAPI` |
+| **Database migrations** | Creates each service's own tables before the service starts (a Kubernetes Job). | `cmd/migrate/main.go`; `db/migrations/{ingest,analyzer,api}/`; `deploy/k8s/base/20-migrate-jobs.yaml` |
+
+### The deployment pieces
+
+| Part | Files |
+|---|---|
+| The four services and three databases as Kubernetes objects (Deployments, StatefulSets, Services) | `deploy/k8s/base/10-` to `33-*.yaml` |
+| Autoscaling (HPA) | inside `deploy/k8s/base/30-ingest.yaml` (2 to 8 pods) and `31-api.yaml` (2 to 6 pods) |
+| Disruption budgets (PDB, keep at least one copy up during upgrades and node drains) | inside `30-ingest.yaml`, `31-api.yaml`, `32-analyzer.yaml` and `33-web.yaml` |
+| Shared settings (scoring thresholds, intervals) | `deploy/k8s/base/01-configmap.yaml` |
+| Load balancer routing: `/api` to api, `/ingest` to ingest, everything else to web; the fixed public IP | `deploy/k8s/overlays/gke/ingress.yaml` |
+| Load balancer health checks (`BackendConfig`) | `deploy/k8s/overlays/gke/backendconfigs.yaml` |
+| Container images | `build/go.Dockerfile` (one file builds all three Go services; the `SERVICE` build argument picks which) and `web/Dockerfile` (dashboard + nginx); built and pushed by `scripts/gcp/build-push.sh` |
+| Start and stop the cluster | `scripts/gcp/scale-up.sh`, `scripts/gcp/scale-down.sh` |
+| Load test used for the autoscaling demo | `scripts/loadtest/ingest-load.sh` |
+
+---
+
+## 8. Could FlakeTracker use real CI data from a real GitHub repo?
+
+**Short answer (say this):** Yes, the receiving side is built and is not tied to fake data.
+The demo data is generated, but it goes in through the same public ingest API a real pipeline
+would use. What we have **not** built is the sending side: a small step in a GitHub Actions
+workflow that turns the test results into our JSON and posts it. That is the missing piece,
+and it is a small one.
+
+### What is built and what is not
+
+| Built (works today) | Not built (would be added) |
+|---|---|
+| `POST /ingest/v1/runs` on the public address, protected by an API key | A step in the repo's GitHub Actions workflow that sends the results |
+| The JSON format and checks (`internal/ingest/payload.go`) | A converter from the test tool's output (for example JUnit XML) to our JSON |
+| Safe retries: the same run sent twice is stored once | Running the cluster all the time (it is scaled to zero when not in use, so a pipeline would get no answer) |
+| Scoring, leaderboard, quarantine on top of whatever is ingested | HTTPS (the key is sent over plain HTTP today) |
+| The field names already match GitHub: the table comment in `db/migrations/ingest/000001_init.up.sql` says `ci_run_id` is `GITHUB_RUN_ID` and `ci_run_attempt` is `GITHUB_RUN_ATTEMPT` | A way for CI to skip quarantined tests (it would call `GET /api/v1/quarantine`) |
+
+### How it would work, step by step
+
+1. **The workflow runs the tests** and writes a result file. Most test tools can write JUnit
+   XML. To see flakiness inside one run the tool must retry failed tests (for example
+   `gotestsum --rerun-fails`, pytest with `pytest-rerunfailures`, or Jest/Playwright retries).
+2. **A converter step** reads that file and builds our JSON: one entry per test, and for each
+   test every attempt in order (`passed`, `failed` or `skipped`, plus duration and error message).
+   Tools record reruns differently, so this converter is written per test tool.
+3. **The same step fills in the run details from GitHub's built-in variables:**
+
+   | Our JSON field | GitHub Actions value |
+   |---|---|
+   | `repository` | `$GITHUB_REPOSITORY` (like `owner/name`) |
+   | `ci_run_id` | `$GITHUB_RUN_ID` |
+   | `ci_run_attempt` | `$GITHUB_RUN_ATTEMPT` (goes up by one when someone clicks "Re-run jobs") |
+   | `branch` | `$GITHUB_REF_NAME` |
+   | `commit_sha` | `$GITHUB_SHA` |
+   | `run_url` | `$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID` |
+   | `started_at` | the time the job started |
+
+4. **The step posts it** with `curl` to `http://<the public IP>/ingest/v1/runs`, with the header
+   `X-API-Key`. The key is stored as a GitHub **secret**, never written in the workflow file.
+   GitHub's runners are on the public internet, so they can reach the load balancer.
+5. **FlakeTracker does the rest.** Ingest saves it, the analyzer picks it up within about 25
+   seconds (10 s feed lag + 15 s loop), and the test shows on the dashboard.
+
+### What a tutor might ask next
+
+- **Would it find flaky tests straight away?** No. A test needs at least 5 results before it is
+  judged (`MIN_SAMPLES`), and the score looks at its last 30. Until then it shows as
+  "insufficient data". A real repo needs a few days of normal pushes, or the old runs loaded in.
+- **Can it read the past history of a repo?** Not through GitHub's API alone. The API gives pass
+  or fail per job, not per test, so per-test results exist only in the test report. A backfill
+  would download the saved report files from old workflow runs and post each one. We did not build that.
+- **What counts as flaky in real data?** The same two signals the seeded data uses: a test that
+  failed and then passed on retry in the same run, and a test that both passed and failed on the
+  same commit (a "Re-run jobs" click gives the same commit with a new attempt number).
+- **Is it safe to open ingest to the internet?** The key protects it, the body is capped at
+  5 MB, and every field is checked. The weak points are HTTP instead of HTTPS (the key could be
+  read on the way) and one shared key for every repo. In production: HTTPS on the load balancer,
+  one key per repo, and rate limiting.
+- **Does quarantine stop the flaky test in CI?** Not yet. The quarantine is a record. The
+  pipeline would call `GET /api/v1/quarantine?repo=owner/name` and skip those tests.
+- **Why did you use generated data then?** A real repo would take days or weeks to build up
+  history, and the demo has to be repeatable. Generated data lets us show every verdict (flaky,
+  broken, stable) and the v1 to v2 change on demand.
+
+### Optional live proof (only if you want to show it)
+
+This sends one made-up run in the exact format a real pipeline would send, so you can show
+that the same endpoint accepts it. It **adds one run and one test to the live data** (450 tests
+becomes 451) and there is no delete button, so do it **after** the numbers have been shown, or skip it.
+
+```bash
+# Send one run, in the real format, to the public ingest endpoint.
+#   -s                  silent (no progress bar)
+#   -X POST             the HTTP method; this endpoint only accepts POST
+#   -H 'X-API-Key: ..'  the secret from the KEY variable set in section 1
+#   -H 'Content-Type..' tells the server the body is JSON
+#   -d '...'            the body; ci_run_id uses the clock so it is unique each time
+#                       (sending the same id twice returns 200 "duplicate" instead)
+curl -s -X POST http://34.96.64.67/ingest/v1/runs \
+  -H "X-API-Key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "repository": "demo/live-ci",
+    "ci_run_id": "'"$(date +%s)"'",
+    "ci_run_attempt": 1,
+    "run_url": "https://github.com/demo/live-ci/actions/runs/1",
+    "branch": "main",
+    "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+    "started_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
+    "results": [
+      {"suite": "checkout", "name": "applies_discount_code",
+       "attempts": [{"status": "failed", "duration_ms": 420, "error": "timeout"},
+                    {"status": "passed", "duration_ms": 380, "error": ""}]}
+    ]
+  }'
+# Expect: {"results":1,"run_id":...}  (HTTP 202). Open the Runs page: the new run is at the top.
+# The test shows as "insufficient data" because it has only one result so far.
+```
+
+---
+
+## 9. After the demo (put it all back)
 
 ```bash
 # Put the analyzer back on v1 so the next run starts the same way.
